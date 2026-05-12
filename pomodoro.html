@@ -1,0 +1,863 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>番茄钟</title>
+<style>
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+  /*
+   * Visual system: "atmospheric minimal"
+   * Direction: deep warm darkness with a single glowing focal element.
+   * No card chrome — the ring IS the interface.
+   * All tokens are in :root so the system stays coherent.
+   */
+
+  :root {
+    /* Core palette */
+    --bg-deep: #050508;
+    --work-color: #ff6b6b;       /* warm coral — feels human, not clinical */
+    --work-glow: rgba(255,107,107,0.25);
+    --break-color: #4ecdc4;      /* mint teal — calm, restorative */
+    --break-glow: rgba(78,205,196,0.2);
+    --text-primary: #e4e4e8;
+    --text-muted: #5e5e6e;
+    --ring-track: #18181f;       /* barely-visible dark ring */
+
+    /* Sizing */
+    --ring-r: 100;               /* SVG radius */
+    --ring-stroke: 10;           /* stroke-width — bolder for presence */
+    --ring-size: min(72vw, 300px);
+
+    /* Timing */
+    --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+    --ease-spring: cubic-bezier(0.175, 0.885, 0.32, 1.275);
+
+    /* Dynamic accent — switched by JS */
+    --accent: var(--work-color);
+    --accent-glow: var(--work-glow);
+
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  }
+
+  body {
+    background: var(--bg-deep);
+    color: var(--text-primary);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    user-select: none;
+    -webkit-user-select: none;
+    overflow: hidden;
+  }
+
+  /*
+   * Atmospheric background: subtle radial warmth emanating from center,
+   * plus SVG noise texture for materiality — never flat.
+   */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background:
+      radial-gradient(ellipse 60% 50% at 50% 50%, rgba(255,107,107,0.04) 0%, transparent 100%),
+      radial-gradient(ellipse 80% 60% at 50% 50%, rgba(78,205,196,0.02) 0%, transparent 100%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* SVG noise overlay — one <rect> in HTML references this */
+  .noise-texture {
+    position: fixed;
+    inset: 0;
+    opacity: 0.025;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /*
+   * Main stage: no card, just the ring floating.
+   * flex column so controls sit naturally below.
+   */
+  .stage {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 36px;
+  }
+
+  /* ─── Ring ────────────────────────────────────────── */
+
+  .ring-container {
+    position: relative;
+    width: var(--ring-size);
+    height: var(--ring-size);
+  }
+
+  /* SVG rotated so progress starts at 12 o'clock */
+  .progress-ring {
+    width: 100%;
+    height: 100%;
+    transform: rotate(-90deg);
+    /* Glow filter applied to the entire ring group */
+    filter: drop-shadow(0 0 18px var(--accent-glow));
+    transition: filter 0.6s var(--ease-out-expo);
+  }
+
+  .ring-track {
+    fill: none;
+    stroke: var(--ring-track);
+    stroke-width: var(--ring-stroke);
+  }
+
+  .ring-progress {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: var(--ring-stroke);
+    stroke-linecap: round;
+    transition: stroke 0.6s var(--ease-out-expo);
+  }
+
+  /* Breathing glow while running — slow, hypnotic */
+  .progress-ring.running {
+    animation: breathe 4s ease-in-out infinite;
+  }
+
+  @keyframes breathe {
+    0%, 100% { filter: drop-shadow(0 0 14px var(--accent-glow)); }
+    50%      { filter: drop-shadow(0 0 28px var(--accent-glow)); }
+  }
+
+  /* Completion pulse: ring expands then settles */
+  .ring-progress.pulse {
+    animation: ring-pulse 0.7s var(--ease-out-expo);
+  }
+
+  @keyframes ring-pulse {
+    0%   { stroke-width: calc(var(--ring-stroke) + 6px); opacity: 0.6; }
+    100% { stroke-width: var(--ring-stroke); opacity: 1; }
+  }
+
+  /* ─── Time display (absolutely centered over the ring) ── */
+
+  .time-display-wrapper {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    gap: 6px;
+  }
+
+  .time-display {
+    font-size: clamp(48px, 12vw, 72px);
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 3px;
+    color: var(--text-primary);
+    line-height: 1;
+  }
+
+  .mode-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 6px;
+    color: var(--accent);
+    transition: color 0.6s var(--ease-out-expo);
+  }
+
+  /* ─── Controls ──────────────────────────────────────── */
+
+  .controls {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+  }
+
+  .btn {
+    border: 1px solid rgba(255,255,255,0.08);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 500;
+    letter-spacing: 0.4px;
+    border-radius: 9999px;        /* pill shape — softer than rounded rects */
+    padding: 10px 28px;
+    transition: border-color 0.25s, background 0.25s, color 0.25s, transform 0.12s;
+    outline: none;
+    background: transparent;
+    color: var(--text-muted);
+  }
+
+  .btn:active { transform: scale(0.96); }
+
+  .btn-primary {
+    background: var(--accent);
+    color: #fff;
+    border-color: transparent;
+    min-width: 120px;
+    font-weight: 600;
+    transition: background 0.6s var(--ease-out-expo), border-color 0.6s var(--ease-out-expo), transform 0.12s;
+  }
+  .btn-primary:hover { filter: brightness(1.12); }
+
+  .btn-secondary:hover {
+    border-color: rgba(255,255,255,0.25);
+    color: var(--text-primary);
+  }
+  .btn-secondary:disabled {
+    opacity: 0.25;
+    cursor: not-allowed;
+  }
+
+  /* ─── Session count ─────────────────────────────────── */
+
+  .session-count {
+    font-size: 12px;
+    color: var(--text-muted);
+    letter-spacing: 0.3px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  /* Dot indicators for completed sessions — more visual than a number alone */
+  .session-dots {
+    display: flex;
+    gap: 4px;
+  }
+  .session-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    opacity: 0.5;
+    transition: background 0.6s var(--ease-out-expo), opacity 0.3s;
+  }
+  .session-dot.filled {
+    opacity: 1;
+  }
+
+  /* ─── Settings ──────────────────────────────────────── */
+
+  .settings-toggle {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: 16px;
+    padding: 6px 10px;
+    border-radius: 50%;
+    transition: color 0.25s, background 0.25s;
+    line-height: 1;
+    opacity: 0.4;
+  }
+  .settings-toggle:hover {
+    opacity: 1;
+    color: var(--text-primary);
+    background: rgba(255,255,255,0.04);
+  }
+
+  .settings-panel {
+    width: 260px;
+    max-width: 80vw;
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.4s var(--ease-out-expo), opacity 0.3s, margin-top 0.4s var(--ease-out-expo);
+    opacity: 0;
+    margin-top: -12px;
+  }
+  .settings-panel.open {
+    max-height: 180px;
+    margin-top: -6px;
+    opacity: 1;
+  }
+
+  .settings-inner {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 14px 0 4px;
+    border-top: 1px solid rgba(255,255,255,0.04);
+  }
+
+  .setting-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .setting-row label {
+    font-size: 13px;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+  .setting-row input {
+    width: 64px;
+    padding: 7px 8px;
+    border-radius: 8px;
+    border: 1px solid rgba(255,255,255,0.08);
+    background: rgba(255,255,255,0.03);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 13px;
+    text-align: center;
+    outline: none;
+    transition: border-color 0.25s;
+  }
+  .setting-row input:focus {
+    border-color: var(--accent);
+  }
+
+  .btn-save-settings {
+    align-self: flex-end;
+    background: rgba(255,255,255,0.06);
+    border: none;
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 7px 18px;
+    border-radius: 9999px;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  .btn-save-settings:hover { background: rgba(255,255,255,0.12); }
+
+  /* ─── Toast ─────────────────────────────────────────── */
+
+  .toast {
+    position: fixed;
+    top: 28px;
+    left: 50%;
+    transform: translateX(-50%) translateY(-120px);
+    background: var(--accent);
+    color: #fff;
+    padding: 10px 22px;
+    border-radius: 9999px;
+    font-weight: 500;
+    font-size: 13px;
+    letter-spacing: 0.3px;
+    transition: transform 0.4s var(--ease-spring);
+    z-index: 100;
+    pointer-events: none;
+  }
+  .toast.show { transform: translateX(-50%) translateY(0); }
+
+  /* ─── Reduced motion ────────────────────────────────── */
+
+  @media (prefers-reduced-motion: reduce) {
+    .progress-ring.running { animation: none; }
+    .ring-progress { transition: none; }
+    .btn { transition: none; }
+    .mode-label { transition: none; }
+  }
+</style>
+</head>
+<body>
+
+<!-- SVG noise texture for atmospheric materiality -->
+<svg class="noise-texture" aria-hidden="true">
+  <filter id="noise">
+    <feTurbulence type="fractalNoise" baseFrequency="0.65" numOctaves="3" stitchTiles="stitch"/>
+    <feColorMatrix type="saturate" values="0"/>
+  </filter>
+  <rect width="100%" height="100%" filter="url(#noise)"/>
+</svg>
+
+<div class="stage">
+
+  <!-- Ring -->
+  <div class="ring-container">
+    <svg class="progress-ring" id="progressRing" viewBox="0 0 220 220">
+      <circle class="ring-track" cx="110" cy="110" r="100"/>
+      <circle class="ring-progress" id="ringProgress" cx="110" cy="110" r="100"/>
+    </svg>
+    <div class="time-display-wrapper">
+      <div class="time-display" id="timeDisplay">25:00</div>
+      <div class="mode-label" id="modeLabel">专注</div>
+    </div>
+  </div>
+
+  <!-- Controls -->
+  <div class="controls">
+    <button class="btn btn-primary" id="btnPrimary">开始</button>
+    <button class="btn btn-secondary" id="btnReset" disabled>重置</button>
+  </div>
+
+  <!-- Session dots -->
+  <div class="session-count">
+    <span class="session-dots" id="sessionDots"></span>
+    <span>已完成 <strong id="sessionCount">0</strong> 次</span>
+  </div>
+
+  <!-- Settings -->
+  <button class="settings-toggle" id="btnSettings" title="设置">&#9881;</button>
+  <div class="settings-panel" id="settingsPanel">
+    <div class="settings-inner">
+      <div class="setting-row">
+        <label for="workInput">专注时长（分钟）</label>
+        <input type="number" id="workInput" min="1" max="60" value="25">
+      </div>
+      <div class="setting-row">
+        <label for="breakInput">休息时长（分钟）</label>
+        <input type="number" id="breakInput" min="1" max="30" value="5">
+      </div>
+      <button class="btn-save-settings" id="btnSaveSettings">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+
+// DOM refs
+const $ = (sel) => document.querySelector(sel);
+
+const progressRing = $('#progressRing');
+const ringProgress = $('#ringProgress');
+const timeDisplay = $('#timeDisplay');
+const modeLabel = $('#modeLabel');
+const btnPrimary = $('#btnPrimary');
+const btnReset = $('#btnReset');
+const sessionCountEl = $('#sessionCount');
+const sessionDots = $('#sessionDots');
+const btnSettings = $('#btnSettings');
+const settingsPanel = $('#settingsPanel');
+const workInput = $('#workInput');
+const breakInput = $('#breakInput');
+const btnSaveSettings = $('#btnSaveSettings');
+const root = document.documentElement;
+const toast = $('#toast');
+
+// SVG ring circumference (r=100, viewBox=220)
+const CIRCUMFERENCE = 2 * Math.PI * 100; // ~628.32
+const STORAGE_KEY = 'pomodoro-state';
+const TICK_MS = 200;
+const AUTO_START_DELAY = 2000;
+const MAX_DOTS = 12; // max session dots to show before cycling
+
+// State factory: persisted settings merged in
+function createDefaultState(overrides) {
+  const wMin = (overrides && overrides.workDuration) || 25;
+  const bMin = (overrides && overrides.breakDuration) || 5;
+  const count = (overrides && overrides.sessionsCompleted) || 0;
+  return {
+    status: 'idle',
+    mode: 'work',
+    workDuration: wMin * 60,
+    breakDuration: bMin * 60,
+    timeRemaining: wMin * 60,
+    sessionsCompleted: count,
+    _startTimestamp: null,
+    _pausedRemaining: null,
+    _intervalId: null,
+    _autoStartTimeoutId: null,
+  };
+}
+
+let state = createDefaultState(loadPersistedState());
+
+ringProgress.style.strokeDasharray = CIRCUMFERENCE;
+ringProgress.style.strokeDashoffset = '0';
+
+// ─── Persistence ───────────────────────────────────────
+
+function loadPersistedState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (_) { /* corrupted, ignore */ }
+  return {};
+}
+
+// Called only on settings change or work completion — not every tick
+function savePersistedState() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      workDuration: state.workDuration / 60,
+      breakDuration: state.breakDuration / 60,
+      sessionsCompleted: state.sessionsCompleted,
+    }));
+  } catch (_) { /* localStorage unavailable, silently ignore */ }
+}
+
+// ─── Audio ─────────────────────────────────────────────
+
+let audioCtx = null;
+
+function getAudioContext() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
+}
+
+function playChime(notes) {
+  try {
+    const ctx = getAudioContext();
+    notes.forEach((freq, i) => {
+      const t = ctx.currentTime + i * 0.2;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.25, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + 0.35);
+    });
+  } catch (_) { /* audio not available */ }
+}
+
+function playWorkComplete() { playChime([523.25, 659.25, 783.99]); } // C5,E5,G5 ascending
+function playBreakComplete() { playChime([659.25, 523.25]); }        // E5,C5 descending
+
+// ─── Notifications ─────────────────────────────────────
+
+function requestNotificationPermission() {
+  if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+}
+
+function showNotification(title, body) {
+  if ('Notification' in window && Notification.permission === 'granted') {
+    new Notification(title, { body, icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="45" fill="%23ff6b6b"/></svg>' });
+  }
+}
+
+function showToast(msg) {
+  toast.textContent = msg;
+  toast.classList.add('show');
+  setTimeout(() => toast.classList.remove('show'), 2200);
+}
+
+// ─── Rendering ─────────────────────────────────────────
+// Each function targets only the DOM nodes it owns
+
+function formatTime(seconds) {
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+}
+
+// stroke-dashoffset = circumference * (1 - fraction)
+// offset=0 = full ring, offset=circumference = empty ring
+function renderRing() {
+  const total = state.mode === 'work' ? state.workDuration : state.breakDuration;
+  const fraction = total > 0 ? state.timeRemaining / total : 0;
+  ringProgress.style.strokeDashoffset = CIRCUMFERENCE * (1 - fraction);
+}
+
+function renderTimeDisplay() {
+  timeDisplay.textContent = formatTime(state.timeRemaining);
+}
+
+function renderModeLabel() {
+  if (state.mode === 'work') {
+    modeLabel.textContent = '专注';
+  } else {
+    modeLabel.textContent = '休息';
+  }
+}
+
+// Switch accent color across the entire system
+function updateAccentColor() {
+  const isWork = state.mode === 'work';
+  root.style.setProperty('--accent', isWork ? 'var(--work-color)' : 'var(--break-color)');
+  root.style.setProperty('--accent-glow', isWork ? 'var(--work-glow)' : 'var(--break-glow)');
+}
+
+function renderControls() {
+  updateAccentColor();
+
+  // Breathing animation only while running
+  if (state.status === 'running') {
+    progressRing.classList.add('running');
+  } else {
+    progressRing.classList.remove('running');
+  }
+
+  switch (state.status) {
+    case 'idle':
+    case 'finished':
+      btnPrimary.textContent = '开始';
+      btnReset.disabled = true;
+      break;
+    case 'running':
+      btnPrimary.textContent = '暂停';
+      btnReset.disabled = false;
+      break;
+    case 'paused':
+      btnPrimary.textContent = '继续';
+      btnReset.disabled = false;
+      break;
+  }
+}
+
+function renderSessionDots() {
+  const count = state.sessionsCompleted;
+  const visible = Math.min(count, MAX_DOTS);
+  sessionDots.innerHTML = '';
+  for (let i = 0; i < MAX_DOTS; i++) {
+    const dot = document.createElement('span');
+    dot.className = 'session-dot' + (i < visible % MAX_DOTS || (visible >= MAX_DOTS) ? ' filled' : '');
+    // When count > MAX_DOTS, show all dots filled (representing "many")
+    // When we wrap around, show count % MAX_DOTS filled
+    sessionDots.appendChild(dot);
+  }
+  // Correct fill when count >= MAX_DOTS but we want to show the modulo
+  if (count > 0 && count < MAX_DOTS) {
+    const dots = sessionDots.querySelectorAll('.session-dot');
+    dots.forEach((d, i) => {
+      d.classList.toggle('filled', i < count);
+    });
+  }
+}
+
+function renderSessionCount() {
+  sessionCountEl.textContent = state.sessionsCompleted;
+  renderSessionDots();
+}
+
+function renderAll() {
+  renderRing();
+  renderTimeDisplay();
+  renderModeLabel();
+  renderControls();
+  renderSessionCount();
+  updateDocTitle();
+}
+
+function updateDocTitle() {
+  const icon = state.status === 'running' ? '▶ ' : state.status === 'paused' ? '⏸ ' : '';
+  const mode = state.mode === 'work' ? '专注' : '休息';
+  document.title = `${icon}${formatTime(state.timeRemaining)} - ${mode}`;
+}
+
+// ─── Timer logic ───────────────────────────────────────
+//
+// Drift-free design: every tick reads Date.now() directly instead of
+// counting intervals. This guarantees accuracy even when the browser
+// throttles setInterval for background tabs.
+//
+// Model:
+//   _startTimestamp  = Date.now() at start/resume
+//   _pausedRemaining = remaining seconds at start/resume
+//   tick: timeRemaining = _pausedRemaining - floor((now - start) / 1000)
+
+function tick() {
+  if (state.status !== 'running') return;
+
+  const elapsed = Math.floor((Date.now() - state._startTimestamp) / 1000);
+  state.timeRemaining = Math.max(0, state._pausedRemaining - elapsed);
+
+  renderRing();
+  renderTimeDisplay();
+  updateDocTitle();
+
+  if (state.timeRemaining <= 0) {
+    completeSession();
+  }
+}
+
+function startTimer() {
+  requestNotificationPermission();
+
+  // idle/finished → capture current remaining as baseline
+  // paused → _pausedRemaining already holds the snapshot, don't overwrite
+  if (state.status === 'idle' || state.status === 'finished') {
+    state._pausedRemaining = state.timeRemaining;
+  }
+
+  state.status = 'running';
+  state._startTimestamp = Date.now();
+  state._intervalId = setInterval(tick, TICK_MS);
+  renderControls();
+  updateDocTitle();
+}
+
+function pauseTimer() {
+  if (state.status !== 'running') return;
+  clearInterval(state._intervalId);
+  if (state._autoStartTimeoutId) {
+    clearTimeout(state._autoStartTimeoutId);
+    state._autoStartTimeoutId = null;
+  }
+  state._pausedRemaining = state.timeRemaining;
+  state.status = 'paused';
+  state._intervalId = null;
+  renderControls();
+  updateDocTitle();
+}
+
+function resetTimer() {
+  clearInterval(state._intervalId);
+  if (state._autoStartTimeoutId) {
+    clearTimeout(state._autoStartTimeoutId);
+    state._autoStartTimeoutId = null;
+  }
+  state.status = 'idle';
+  state.timeRemaining = state.mode === 'work' ? state.workDuration : state.breakDuration;
+  state._pausedRemaining = null;
+  state._startTimestamp = null;
+  state._intervalId = null;
+  renderAll();
+}
+
+function completeSession() {
+  clearInterval(state._intervalId);
+  state._intervalId = null;
+  state.status = 'finished';
+
+  if (state.mode === 'work') {
+    playWorkComplete();
+    state.sessionsCompleted++;
+    savePersistedState();
+    showNotification('番茄钟', '专注时间结束！该休息一下了。');
+    showToast('专注完成，休息一下吧');
+  } else {
+    playBreakComplete();
+    showNotification('番茄钟', '休息时间结束！开始新的专注吧。');
+    showToast('休息结束，继续加油');
+  }
+
+  renderRing();
+  renderSessionCount();
+
+  ringProgress.classList.add('pulse');
+  setTimeout(() => ringProgress.classList.remove('pulse'), 700);
+
+  // Switch mode
+  if (state.mode === 'work') {
+    state.mode = 'break';
+    state.timeRemaining = state.breakDuration;
+  } else {
+    state.mode = 'work';
+    state.timeRemaining = state.workDuration;
+  }
+
+  renderTimeDisplay();
+  renderModeLabel();
+  updateAccentColor();
+  btnPrimary.textContent = '开始';
+  btnReset.disabled = true;
+  progressRing.classList.remove('running');
+  updateDocTitle();
+
+  // Auto-start after delay, unless user pauses in the meantime
+  state._autoStartTimeoutId = setTimeout(() => {
+    if (state.status === 'finished') {
+      startTimer();
+    }
+  }, AUTO_START_DELAY);
+}
+
+// Main button state machine
+function toggleTimer() {
+  switch (state.status) {
+    case 'idle':
+    case 'finished':
+      startTimer();
+      break;
+    case 'running':
+      pauseTimer();
+      break;
+    case 'paused':
+      startTimer();
+      break;
+  }
+}
+
+// ─── Settings ──────────────────────────────────────────
+
+function toggleSettings() {
+  const open = settingsPanel.classList.toggle('open');
+  if (open) {
+    workInput.value = state.workDuration / 60;
+    breakInput.value = state.breakDuration / 60;
+    workInput.focus();
+  }
+}
+
+function saveSettings() {
+  const w = parseInt(workInput.value, 10);
+  const b = parseInt(breakInput.value, 10);
+
+  // Clamp to valid range, fallback to defaults on invalid input
+  const workMin = Math.max(1, Math.min(60, isNaN(w) ? 25 : w));
+  const breakMin = Math.max(1, Math.min(30, isNaN(b) ? 5 : b));
+
+  workInput.value = workMin;
+  breakInput.value = breakMin;
+
+  // Apply new durations and reset to idle
+  clearInterval(state._intervalId);
+  if (state._autoStartTimeoutId) {
+    clearTimeout(state._autoStartTimeoutId);
+    state._autoStartTimeoutId = null;
+  }
+
+  state.workDuration = workMin * 60;
+  state.breakDuration = breakMin * 60;
+  state.status = 'idle';
+  state.mode = 'work';
+  state.timeRemaining = state.workDuration;
+  state._startTimestamp = null;
+  state._pausedRemaining = null;
+  state._intervalId = null;
+
+  savePersistedState();
+  renderAll();
+  settingsPanel.classList.remove('open');
+
+  showToast('设置已保存');
+}
+
+// ─── Event bindings ────────────────────────────────────
+
+btnPrimary.addEventListener('click', toggleTimer);
+btnReset.addEventListener('click', resetTimer);
+btnSettings.addEventListener('click', toggleSettings);
+btnSaveSettings.addEventListener('click', saveSettings);
+
+[workInput, breakInput].forEach((input) => {
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') saveSettings();
+  });
+});
+
+// Keyboard shortcuts (disabled while typing in inputs)
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT') return;
+
+  switch (e.code) {
+    case 'Space':
+      e.preventDefault();
+      toggleTimer();
+      break;
+    case 'KeyR':
+      resetTimer();
+      break;
+  }
+});
+
+// ─── Initial render ────────────────────────────────────
+renderAll();
+</script>
+</body>
+</html>
