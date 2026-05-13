@@ -440,21 +440,23 @@ const btnSaveSettings = $('#btnSaveSettings');
 const root = document.documentElement;
 const toast = $('#toast');
 
-// SVG ring circumference (r=100, viewBox=220)
-const CIRCUMFERENCE = 2 * Math.PI * 100; // ~628.32
+const CIRCUMFERENCE = 2 * Math.PI * 100;
 const STORAGE_KEY = 'pomodoro-state';
 const TICK_MS = 200;
 const AUTO_START_DELAY = 2000;
-const MAX_DOTS = 12; // max session dots to show before cycling
+const MAX_DOTS = 12;
 
-// State factory: persisted settings merged in
+const STATUS = { IDLE: 'idle', RUNNING: 'running', PAUSED: 'paused', FINISHED: 'finished' };
+const MODE = { WORK: 'work', BREAK: 'break' };
+const CHIME_NOTES = { work: [523.25, 659.25, 783.99], break: [659.25, 523.25] };
+
 function createDefaultState(overrides) {
   const wMin = (overrides && overrides.workDuration) || 25;
   const bMin = (overrides && overrides.breakDuration) || 5;
   const count = (overrides && overrides.sessionsCompleted) || 0;
   return {
-    status: 'idle',
-    mode: 'work',
+    status: STATUS.IDLE,
+    mode: MODE.WORK,
     workDuration: wMin * 60,
     breakDuration: bMin * 60,
     timeRemaining: wMin * 60,
@@ -463,6 +465,7 @@ function createDefaultState(overrides) {
     _pausedRemaining: null,
     _intervalId: null,
     _autoStartTimeoutId: null,
+    _lastRenderedSecond: -1,   // guards against redundant DOM writes in tick()
   };
 }
 
@@ -481,7 +484,6 @@ function loadPersistedState() {
   return {};
 }
 
-// Called only on settings change or work completion — not every tick
 function savePersistedState() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
@@ -523,8 +525,7 @@ function playChime(notes) {
   } catch (_) { /* audio not available */ }
 }
 
-function playWorkComplete() { playChime([523.25, 659.25, 783.99]); } // C5,E5,G5 ascending
-function playBreakComplete() { playChime([659.25, 523.25]); }        // E5,C5 descending
+function playModeChime(mode) { playChime(CHIME_NOTES[mode]); }
 
 // ─── Notifications ─────────────────────────────────────
 
@@ -558,7 +559,7 @@ function formatTime(seconds) {
 // stroke-dashoffset = circumference * (1 - fraction)
 // offset=0 = full ring, offset=circumference = empty ring
 function renderRing() {
-  const total = state.mode === 'work' ? state.workDuration : state.breakDuration;
+  const total = state[state.mode + 'Duration'];
   const fraction = total > 0 ? state.timeRemaining / total : 0;
   ringProgress.style.strokeDashoffset = CIRCUMFERENCE * (1 - fraction);
 }
@@ -568,64 +569,49 @@ function renderTimeDisplay() {
 }
 
 function renderModeLabel() {
-  if (state.mode === 'work') {
-    modeLabel.textContent = '专注';
-  } else {
-    modeLabel.textContent = '休息';
-  }
+  modeLabel.textContent = state.mode === MODE.WORK ? '专注' : '休息';
 }
 
-// Switch accent color across the entire system
 function updateAccentColor() {
-  const isWork = state.mode === 'work';
+  const isWork = state.mode === MODE.WORK;
   root.style.setProperty('--accent', isWork ? 'var(--work-color)' : 'var(--break-color)');
   root.style.setProperty('--accent-glow', isWork ? 'var(--work-glow)' : 'var(--break-glow)');
 }
 
 function renderControls() {
-  updateAccentColor();
-
-  // Breathing animation only while running
-  if (state.status === 'running') {
-    progressRing.classList.add('running');
-  } else {
-    progressRing.classList.remove('running');
-  }
+  const wasRunning = progressRing.classList.contains('running');
 
   switch (state.status) {
-    case 'idle':
-    case 'finished':
+    case STATUS.IDLE:
+    case STATUS.FINISHED:
       btnPrimary.textContent = '开始';
       btnReset.disabled = true;
+      progressRing.classList.remove('running');
       break;
-    case 'running':
+    case STATUS.RUNNING:
       btnPrimary.textContent = '暂停';
       btnReset.disabled = false;
+      progressRing.classList.add('running');
       break;
-    case 'paused':
+    case STATUS.PAUSED:
       btnPrimary.textContent = '继续';
       btnReset.disabled = false;
+      progressRing.classList.remove('running');
       break;
   }
 }
 
 function renderSessionDots() {
   const count = state.sessionsCompleted;
-  const visible = Math.min(count, MAX_DOTS);
+  if (count === sessionDots._lastCount) return;
+  sessionDots._lastCount = count;
+
+  const filled = count >= MAX_DOTS ? MAX_DOTS : count % MAX_DOTS;
   sessionDots.innerHTML = '';
   for (let i = 0; i < MAX_DOTS; i++) {
     const dot = document.createElement('span');
-    dot.className = 'session-dot' + (i < visible % MAX_DOTS || (visible >= MAX_DOTS) ? ' filled' : '');
-    // When count > MAX_DOTS, show all dots filled (representing "many")
-    // When we wrap around, show count % MAX_DOTS filled
+    dot.className = 'session-dot' + (i < filled ? ' filled' : '');
     sessionDots.appendChild(dot);
-  }
-  // Correct fill when count >= MAX_DOTS but we want to show the modulo
-  if (count > 0 && count < MAX_DOTS) {
-    const dots = sessionDots.querySelectorAll('.session-dot');
-    dots.forEach((d, i) => {
-      d.classList.toggle('filled', i < count);
-    });
   }
 }
 
@@ -635,6 +621,7 @@ function renderSessionCount() {
 }
 
 function renderAll() {
+  updateAccentColor();
   renderRing();
   renderTimeDisplay();
   renderModeLabel();
@@ -644,9 +631,9 @@ function renderAll() {
 }
 
 function updateDocTitle() {
-  const icon = state.status === 'running' ? '▶ ' : state.status === 'paused' ? '⏸ ' : '';
-  const mode = state.mode === 'work' ? '专注' : '休息';
-  document.title = `${icon}${formatTime(state.timeRemaining)} - ${mode}`;
+  const icon = state.status === STATUS.RUNNING ? '▶ ' : state.status === STATUS.PAUSED ? '⏸ ' : '';
+  const modeText = state.mode === MODE.WORK ? '专注' : '休息';
+  document.title = `${icon}${formatTime(state.timeRemaining)} - ${modeText}`;
 }
 
 // ─── Timer logic ───────────────────────────────────────
@@ -655,16 +642,27 @@ function updateDocTitle() {
 // counting intervals. This guarantees accuracy even when the browser
 // throttles setInterval for background tabs.
 //
-// Model:
 //   _startTimestamp  = Date.now() at start/resume
 //   _pausedRemaining = remaining seconds at start/resume
 //   tick: timeRemaining = _pausedRemaining - floor((now - start) / 1000)
 
+function clearAllTimers() {
+  clearInterval(state._intervalId);
+  state._intervalId = null;
+  if (state._autoStartTimeoutId) {
+    clearTimeout(state._autoStartTimeoutId);
+    state._autoStartTimeoutId = null;
+  }
+}
+
 function tick() {
-  if (state.status !== 'running') return;
+  if (state.status !== STATUS.RUNNING) return;
 
   const elapsed = Math.floor((Date.now() - state._startTimestamp) / 1000);
-  state.timeRemaining = Math.max(0, state._pausedRemaining - elapsed);
+  const newRemaining = Math.max(0, state._pausedRemaining - elapsed);
+
+  if (newRemaining === state.timeRemaining) return; // guard: only DOM-write when second changes
+  state.timeRemaining = newRemaining;
 
   renderRing();
   renderTimeDisplay();
@@ -680,11 +678,11 @@ function startTimer() {
 
   // idle/finished → capture current remaining as baseline
   // paused → _pausedRemaining already holds the snapshot, don't overwrite
-  if (state.status === 'idle' || state.status === 'finished') {
+  if (state.status !== STATUS.PAUSED) {
     state._pausedRemaining = state.timeRemaining;
   }
 
-  state.status = 'running';
+  state.status = STATUS.RUNNING;
   state._startTimestamp = Date.now();
   state._intervalId = setInterval(tick, TICK_MS);
   renderControls();
@@ -692,94 +690,66 @@ function startTimer() {
 }
 
 function pauseTimer() {
-  if (state.status !== 'running') return;
-  clearInterval(state._intervalId);
-  if (state._autoStartTimeoutId) {
-    clearTimeout(state._autoStartTimeoutId);
-    state._autoStartTimeoutId = null;
-  }
+  if (state.status !== STATUS.RUNNING) return;
+  clearAllTimers();
   state._pausedRemaining = state.timeRemaining;
-  state.status = 'paused';
-  state._intervalId = null;
+  state.status = STATUS.PAUSED;
   renderControls();
   updateDocTitle();
 }
 
 function resetTimer() {
-  clearInterval(state._intervalId);
-  if (state._autoStartTimeoutId) {
-    clearTimeout(state._autoStartTimeoutId);
-    state._autoStartTimeoutId = null;
-  }
-  state.status = 'idle';
-  state.timeRemaining = state.mode === 'work' ? state.workDuration : state.breakDuration;
+  clearAllTimers();
+  state.status = STATUS.IDLE;
+  state.timeRemaining = state[state.mode + 'Duration'];
   state._pausedRemaining = null;
   state._startTimestamp = null;
-  state._intervalId = null;
   renderAll();
 }
 
 function completeSession() {
-  clearInterval(state._intervalId);
-  state._intervalId = null;
-  state.status = 'finished';
+  clearAllTimers();
+  state.status = STATUS.FINISHED;
 
-  if (state.mode === 'work') {
-    playWorkComplete();
+  if (state.mode === MODE.WORK) {
     state.sessionsCompleted++;
     savePersistedState();
     showNotification('番茄钟', '专注时间结束！该休息一下了。');
     showToast('专注完成，休息一下吧');
   } else {
-    playBreakComplete();
     showNotification('番茄钟', '休息时间结束！开始新的专注吧。');
     showToast('休息结束，继续加油');
   }
+  playModeChime(state.mode);
 
-  renderRing();
-  renderSessionCount();
+  // Switch mode with computed property key
+  state.mode = state.mode === MODE.WORK ? MODE.BREAK : MODE.WORK;
+  state.timeRemaining = state[state.mode + 'Duration'];
 
   ringProgress.classList.add('pulse');
   setTimeout(() => ringProgress.classList.remove('pulse'), 700);
 
-  // Switch mode
-  if (state.mode === 'work') {
-    state.mode = 'break';
-    state.timeRemaining = state.breakDuration;
-  } else {
-    state.mode = 'work';
-    state.timeRemaining = state.workDuration;
-  }
-
+  updateAccentColor();
+  renderRing();
   renderTimeDisplay();
   renderModeLabel();
-  updateAccentColor();
-  btnPrimary.textContent = '开始';
-  btnReset.disabled = true;
-  progressRing.classList.remove('running');
+  renderControls();
+  renderSessionCount();
   updateDocTitle();
 
-  // Auto-start after delay, unless user pauses in the meantime
   state._autoStartTimeoutId = setTimeout(() => {
-    if (state.status === 'finished') {
+    if (state.status === STATUS.FINISHED) {
       startTimer();
     }
   }, AUTO_START_DELAY);
 }
 
-// Main button state machine
 function toggleTimer() {
   switch (state.status) {
-    case 'idle':
-    case 'finished':
-      startTimer();
-      break;
-    case 'running':
-      pauseTimer();
-      break;
-    case 'paused':
-      startTimer();
-      break;
+    case STATUS.IDLE:
+    case STATUS.FINISHED: startTimer(); break;
+    case STATUS.RUNNING:  pauseTimer(); break;
+    case STATUS.PAUSED:   startTimer(); break;
   }
 }
 
@@ -798,33 +768,24 @@ function saveSettings() {
   const w = parseInt(workInput.value, 10);
   const b = parseInt(breakInput.value, 10);
 
-  // Clamp to valid range, fallback to defaults on invalid input
   const workMin = Math.max(1, Math.min(60, isNaN(w) ? 25 : w));
   const breakMin = Math.max(1, Math.min(30, isNaN(b) ? 5 : b));
 
   workInput.value = workMin;
   breakInput.value = breakMin;
 
-  // Apply new durations and reset to idle
-  clearInterval(state._intervalId);
-  if (state._autoStartTimeoutId) {
-    clearTimeout(state._autoStartTimeoutId);
-    state._autoStartTimeoutId = null;
-  }
-
+  clearAllTimers();
   state.workDuration = workMin * 60;
   state.breakDuration = breakMin * 60;
-  state.status = 'idle';
-  state.mode = 'work';
+  state.status = STATUS.IDLE;
+  state.mode = MODE.WORK;
   state.timeRemaining = state.workDuration;
   state._startTimestamp = null;
   state._pausedRemaining = null;
-  state._intervalId = null;
 
   savePersistedState();
   renderAll();
   settingsPanel.classList.remove('open');
-
   showToast('设置已保存');
 }
 
@@ -841,7 +802,6 @@ btnSaveSettings.addEventListener('click', saveSettings);
   });
 });
 
-// Keyboard shortcuts (disabled while typing in inputs)
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'INPUT') return;
 
